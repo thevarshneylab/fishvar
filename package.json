@@ -1,0 +1,36 @@
+{
+  "name": "fishvar",
+  "version": "0.1.0",
+  "description": "Map a human ClinVar missense variant onto its orthologous zebrafish codon and design Umax base-editing guides for it.",
+  "keywords": [
+    "zebrafish",
+    "base editing",
+    "clinvar",
+    "crispr",
+    "sgrna",
+    "orthologue",
+    "variant",
+    "danio rerio"
+  ],
+  "license": "MIT",
+  "bin": {
+    "fishvar": "bin/fishvar.js"
+  },
+  "main": "lib/pipeline.js",
+  "scripts": {
+    "fixtures": "node test/build-fixtures.js",
+    "test": "node test/build-fixtures.js && node test/run.js",
+    "coverage": "node tools/coverage.js",
+    "demo": "node bin/fishvar.js TESTA:p.Arg100His --cache-dir ./fixtures --cache-only --top 3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "files": [
+    "bin",
+    "lib",
+    "vendor",
+    "README.md"
+  ]
+}
