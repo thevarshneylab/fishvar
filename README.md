@@ -107,6 +107,34 @@ Two details that are easy to get wrong and are handled here:
 
 Escaping candidates are reported rather than hidden, each with the rule it broke and why — sometimes a late stop is the only option, and that is a decision to make knowingly.
 
+## Web app
+
+The same tool runs entirely in the browser at
+**https://thevarshneylab.github.io/fishvar/** — no install, no backend, nothing
+uploaded. It is the sibling of
+[`umax-guide-designer`](https://github.com/thevarshneylab/umax-guide-designer)
+and shares its design tokens.
+
+`docs/` is the published site, generated from `lib/` by `npm run bundle`. The
+browser and the command line therefore run the **same** code: there is no second
+implementation to drift. `npm test` fails if `docs/` is stale, so a change to
+`lib/` that was not rebuilt cannot ship.
+
+Ensembl REST [sends `Access-Control-Allow-Origin: *` and documents CORS as the
+way to use it from a browser](https://github.com/Ensembl/ensembl-rest/wiki/CORS-And-JSONP),
+which is what makes a serverless build possible. NCBI is the one unknown: if
+E-utilities does not allow cross-origin reads, ClinVar accession and rsID lookup
+cannot work client-side. The page handles that explicitly rather than failing
+opaquely — it names the blocked host and points you at `GENE:p.Change` input,
+which never touches NCBI and produces an identical design.
+
+To preview the site offline against the test fixtures:
+
+```bash
+npm run bundle && npm run serve
+# http://localhost:8099/#VCV000077777
+```
+
 ## Install
 
 ```bash
@@ -203,7 +231,9 @@ A variant that is legitimately unmodelable exits 0. "Not conserved in zebrafish"
 npm test
 ```
 
-202 checks, entirely offline. Fixtures are written into the HTTP cache under the exact filenames the client would use, so the suite exercises the real code path including URL construction — a wrongly built URL fails as a cache miss.
+256 checks across three suites, entirely offline — `test/run.js` for the design logic, `test/bundle.js` for whether the browser bundle agrees with the CLI variant by variant, and `test/dom.js` for the page's own render paths against a minimal DOM. Fixtures are written into the HTTP cache under the exact filenames the client would use, so the suite exercises the real code path including URL construction — a wrongly built URL fails as a cache miss.
+
+The bundle suite stubs `fetch` against those same fixtures and diffs the browser result against the CLI result field by field, so the two cannot silently diverge. The DOM suite drives the page's real click handler and asserts on what it rendered, including the blocked-host and ClinVar-fallback messages.
 
 The suite re-derives the top guide's spacer and PAM from the context sequence independently of `umax.js`, applies the edit and confirms the resulting codon, and checks that the palette and the engine agree about guide strand for every route. Coverage includes the conserved, non-conserved, alignment-gap, split-codon, exon-junction, isoform-mismatch and unreachable-codon cases on the missense path, and nonsense, frameshift, start-loss, all four NMD escape rules, the 55 nt threshold on its exact boundary, reverse-strand transcript geometry and multi-exon 3′ UTRs on the stop path.
 
