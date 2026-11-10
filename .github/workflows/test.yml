@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check editors.json is valid JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('vendor/editors.json','utf8'))"
+
+      - name: Check scripts parse
+        run: |
+          for f in lib/*.js bin/*.js tools/*.js test/*.js docs/app.js docs/fishvar.bundle.js; do
+            node --check "$f" || exit 1
+          done
+
+      - name: Vendored engine must be unmodified
+        run: |
+          # docs/ serves copies of vendor/; they must match byte for byte, or the
+          # page and the command line are running different engines.
+          cmp vendor/umax.js docs/umax.js
+          cmp vendor/editors.json docs/editors.json
+
+      # Covers the design logic, the browser bundle's agreement with the CLI,
+      # the page's render paths, and whether docs/ was rebuilt after lib/ changed.
+      - name: Run test suites
+        run: npm test
+
+      - name: Reachability table still computes
+        run: npm run coverage
