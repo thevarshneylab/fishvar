@@ -1,6 +1,11 @@
 # fishvar
 
-Takes a human ClinVar missense variant, finds the orthologous codon in zebrafish, works out which single base change is needed *there*, and designs Umax base-editing guides for it.
+Takes a human ClinVar variant and designs Umax base-editing guides to model it in zebrafish, choosing the strategy from the variant class:
+
+| Variant class | Strategy |
+|---|---|
+| missense | install the same residue substitution at the orthologous codon |
+| nonsense, frameshift, start loss | install a premature stop in the orthologue, ranked by whether the transcript will actually be degraded |
 
 This is the front half of the pipeline that [`umax-guide-designer`](https://github.com/thevarshneylab/umax-guide-designer) doesn't cover. That tool needs a sequence and a target base; this one produces them from a variant ID.
 
@@ -80,6 +85,28 @@ That is 8 of the 12 possible substitutions. **`C>A`, `C>G`, `G>C` and `G>T` cann
 
 The ABE+CBE row is a useful sanity check: it lands close to the ~30% of ClinVar that ACEofBASEs reported as accessible with a standard window and NGG PAM. The transversion editors roughly double it. The same script lists the 41 substitution classes that are reachable by one base change but never by this palette — `G>A`/`G>C`/`G>V`/`G>W` (the collagenopathy glycine substitutions), `R>P/L/I/M/T`, `P>A/H/Q/R/T` and others worth surfacing in a UI as hard refusals.
 
+## Truncating variants: where to put the stop
+
+For a truncating variant the residue is not mapped at all — a premature stop discards everything downstream, so only the position matters and conservation is irrelevant. The tool scans the zebrafish coding sequence for codons the palette can turn into a stop. With cytosine editing alone that is the classic iSTOP set — `CAA`, `CAG`, `CGA`, `TGG` — and the transversion editors add `AAA`, `AAG`, `AGA`, `TAT`, `TGT`, `TTA` and `TTG`.
+
+Finding the codons is easy. Choosing among them is the part that matters, because **a premature stop is only a null allele if the transcript is actually degraded.** Nonsense-mediated decay is positional, so each candidate is classified:
+
+| Rule | Effect |
+|---|---|
+| PTC in the last exon, or <55 nt upstream of the last exon–exon junction | escapes NMD |
+| transcript has no exon–exon junction at all | escapes NMD |
+| PTC within 150 nt of the start codon | uncertain — reinitiation can bypass it |
+| PTC in an exon longer than 400 nt | uncertain — escapes more often than the junction rule predicts |
+
+The 55 nt convention follows the iSTOP literature, which checks that the targeted nucleotide sits at least 55 nt upstream of the final exon–exon junction. Candidates are ranked by NMD competence first, then by position relative to the orthologue of the human lesion — a stop at or upstream of it removes at least as much protein as the human allele, so those are preferred over one the same distance downstream.
+
+Two details that are easy to get wrong and are handled here:
+
+- **The last exon–exon junction belongs to the transcript, not the CDS.** A multi-exon 3′ UTR puts it downstream of the stop codon, which can make even the final coding codon NMD-competent. Computing the junction from coding blocks alone would call those escapes.
+- **Candidates are ordered before any sequence is fetched.** NMD competence and distance from the lesion come from the CDS and exon structure, so only the top `--ptc-top` candidates cost a request each. A long gene with hundreds of stop-able codons still runs in a bounded number of calls.
+
+Escaping candidates are reported rather than hidden, each with the rule it broke and why — sometimes a late stop is the only option, and that is a decision to make knowingly.
+
 ## Install
 
 ```bash
@@ -116,13 +143,14 @@ fishvar --batch variants.txt --format csv > designs.csv
 | `--umax-path DIR` | checkout of `umax-guide-designer` |
 | `--include-untested` | include predicted editor/backbone pairings |
 | `--max-paralogs N` | conserved orthologues to design against (default 4) |
+| `--ptc-top N` | stop candidates to design guides for (default 12) |
 | `--ncbi-api-key KEY` | raises the NCBI rate limit (or `NCBI_API_KEY`) |
 
 Every response is cached. That is a reproducibility feature, not just a speed one: a design that went into an injection can be re-derived months later from the same data with `--cache-only`, even after an Ensembl release has moved.
 
 ## How it works
 
-1. **ClinVar** — E-utilities `esearch` + `esummary` give the gene, the HGVS protein change and the classification.
+1. **ClinVar** — E-utilities `esearch` + `esummary` give the gene, the HGVS protein change and the classification. The protein change decides which strategy runs.
 2. **Orthology** — one Ensembl REST call returns the Compara protein alignment with `align_seq` for both species, so residue-to-residue mapping needs no local aligner.
 3. **Residue mapping** — the human residue's alignment column is read off, then converted to a zebrafish residue number.
 4. **Codon retrieval** — `/map/translation` gives the codon's genomic coordinates; the region is fetched with an explicit strand so the sequence comes back already in coding orientation.
@@ -135,7 +163,7 @@ Guide finding, scoring and protein-consequence calling are **not** reimplemented
 
 **Isoform agreement.** A ClinVar `p.` change is numbered against a RefSeq protein; the Compara alignment is numbered against Ensembl canonical. These can disagree. If the human residue at the mapped column isn't the wild-type residue ClinVar reported, the variant is rejected as `isoform_mismatch` rather than designed against — a silent numbering error would otherwise produce a confident, wrong guide.
 
-**Conservation.** Modelling a substitution only means something if zebrafish carries the same wild-type residue. Non-conserved positions are reported with what zebrafish has instead.
+**Conservation.** Modelling a substitution only means something if zebrafish carries the same wild-type residue. Non-conserved positions are reported with what zebrafish has instead. This applies to the missense path only — a premature stop does not substitute the residue, so the stop path needs the position and not the identity, and where the residue falls in an alignment gap it uses the nearest aligned one, searching upstream first.
 
 **Codon agreement.** The genomic codon must encode the residue the alignment promised. If the protein, the assembly and the alignment disagree, the position is refused.
 
@@ -152,7 +180,7 @@ Guide finding, scoring and protein-consequence calling are **not** reimplemented
 | `ok` | at least one guide designed |
 | `not_modelable` | residue not conserved in any zebrafish orthologue |
 | `isoform_mismatch` | ClinVar and Ensembl numbering disagree; check the transcript |
-| `unsupported_consequence` | not a missense SNV (see scope below) |
+| `unsupported_consequence` | not a class either strategy models (see scope below) |
 | `no_ortholog` | Compara reports no zebrafish orthologue with a protein alignment |
 | `no_design` | mapped successfully, but nothing could be built |
 
@@ -162,7 +190,7 @@ A variant that is legitimately unmodelable exits 0. "Not conserved in zebrafish"
 
 ## Scope and limitations
 
-- **Missense SNVs only.** Truncating, splice and non-coding variants are reported as out of scope. For a truncating variant the useful zebrafish model is usually a CBE-installed premature stop anywhere in a suitable codon (`CGA>TGA`, `CAA>TAA`, `CAG>TAG`, `TGG>TGA/TAG`), which ignores residue mapping entirely and is a different code path.
+- **Missense and truncating variants.** Splice-site, stop-loss and non-coding variants are reported as out of scope. Stop-loss is excluded deliberately rather than for lack of effort: read-through extends the protein, so a premature stop models the opposite lesion.
 - **No off-target search.** Inherited from the upstream tool. Run candidate spacers through CRISPOR or Cas-OFFinder against *Danio rerio* GRCz11.
 - **No efficiency prediction.** The score is a triage heuristic from the upstream engine, not a trained model; published models were not trained on zebrafish embryos.
 - **Ensembl canonical transcript only.** No isoform selection.
@@ -175,9 +203,9 @@ A variant that is legitimately unmodelable exits 0. "Not conserved in zebrafish"
 npm test
 ```
 
-100 checks, entirely offline. Fixtures are written into the HTTP cache under the exact filenames the client would use, so the suite exercises the real code path including URL construction — a wrongly built URL fails as a cache miss.
+202 checks, entirely offline. Fixtures are written into the HTTP cache under the exact filenames the client would use, so the suite exercises the real code path including URL construction — a wrongly built URL fails as a cache miss.
 
-The suite re-derives the top guide's spacer and PAM from the context sequence independently of `umax.js`, applies the edit and confirms the resulting codon, and checks that the palette and the engine agree about guide strand for every route. Coverage includes the conserved, non-conserved, alignment-gap, split-codon, exon-junction, isoform-mismatch, unreachable-codon and truncating-variant cases.
+The suite re-derives the top guide's spacer and PAM from the context sequence independently of `umax.js`, applies the edit and confirms the resulting codon, and checks that the palette and the engine agree about guide strand for every route. Coverage includes the conserved, non-conserved, alignment-gap, split-codon, exon-junction, isoform-mismatch and unreachable-codon cases on the missense path, and nonsense, frameshift, start-loss, all four NMD escape rules, the 55 nt threshold on its exact boundary, reverse-strand transcript geometry and multi-exon 3′ UTRs on the stop path.
 
 > [!IMPORTANT]
 > The test suite is fixture-based and the fixtures are synthetic. The live

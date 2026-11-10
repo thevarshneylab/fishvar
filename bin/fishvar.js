@@ -32,13 +32,19 @@ var USAGE = [
   "  --umax-path <dir>          checkout of umax-guide-designer (default ./vendor)",
   "  --include-untested         include predicted editor/backbone pairings",
   "  --max-paralogs <n>         conserved orthologues to design against (default 4)",
+  "  --ptc-top <n>              stop candidates to design guides for (default 12)",
   "  --ncbi-api-key <key>       raises the NCBI rate limit; or set NCBI_API_KEY",
   "  --quiet                    suppress progress on stderr",
   "  -h, --help                 this message",
   "",
-  "v1 handles missense SNVs. Truncating, splice and non-coding variants are",
-  "reported as out of scope rather than mapped, because a premature-stop model is",
-  "a different design problem.",
+  "Two strategies are chosen automatically from the variant class:",
+  "",
+  "  missense                      -> the orthologous residue substitution",
+  "  nonsense / frameshift / start -> a premature stop in the orthologue, ranked",
+  "                                   by nonsense-mediated decay competence",
+  "",
+  "Splice, stop-loss and non-coding variants are reported as out of scope rather",
+  "than mapped.",
   ""
 ].join("\n");
 
@@ -61,6 +67,7 @@ function parseArgs(argv) {
       case "--umax-path": opts.umaxPath = next(); break;
       case "--include-untested": opts.includeUntested = true; break;
       case "--max-paralogs": opts.maxParalogs = Number(next()); break;
+      case "--ptc-top": opts.ptcTop = Number(next()); break;
       case "--ncbi-api-key": opts.ncbiApiKey = next(); break;
       case "--quiet": opts.quiet = true; break;
       default:

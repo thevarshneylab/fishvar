@@ -11,6 +11,7 @@ var palette = require("../lib/palette.js");
 var ortholog = require("../lib/ortholog.js");
 var clinvar = require("../lib/clinvar.js");
 var pipeline = require("../lib/pipeline.js");
+var ptc = require("../lib/ptc.js");
 
 var FIXTURES = path.join(__dirname, "..", "fixtures");
 var OPTS = { cacheDir: FIXTURES, cacheOnly: true };
@@ -102,6 +103,123 @@ eq("column 2 is a gap", idx.residueOfCol[2], null);
 eq("four residues", idx.length, 4);
 
 /* ------------------------------------------------------------------ */
+section("Stop-able codons");
+
+var stops = ptc.stopRoutes(UMAX.CODONS, pal);
+eq("eleven codons can be driven to a stop", stops.size, 11);
+var cbeStops = [...stops.entries()]
+  .filter(function (e) {
+    return e[1].some(function (w) {
+      return w.routes.some(function (r) { return r.family === "CBE"; });
+    });
+  })
+  .map(function (e) { return e[0]; }).sort();
+eq("cytosine editing alone gives the classic iSTOP set", cbeStops.join(","), "CAA,CAG,CGA,TGG");
+check("every stop route really produces a stop",
+  [...stops.values()].every(function (ways) {
+    return ways.every(function (w) { return UMAX.CODONS[w.stopCodon] === "*"; });
+  }));
+check("no stop codon is itself listed as a source",
+  [...stops.keys()].every(function (c) { return UMAX.CODONS[c] !== "*"; }));
+
+/* ------------------------------------------------------------------ */
+section("Transcript geometry and NMD rules");
+
+/* Three exons, a 5' UTR, and a single-exon 3' UTR. Forward strand. */
+var fwd = ptc.buildTranscriptModel(
+  [{ seq_region_name: "1", start: 1100, end: 1199, strand: 1 },
+   { seq_region_name: "1", start: 2000, end: 2099, strand: 1 },
+   { seq_region_name: "1", start: 3000, end: 3099, strand: 1 }],
+  [{ start: 1000, end: 1199 }, { start: 2000, end: 2099 }, { start: 3000, end: 3399 }]
+);
+eq("exon count", fwd.exonCount, 3);
+eq("CDS length", fwd.cdsLength, 300);
+eq("transcript length", fwd.transcriptLength, 700);
+eq("last junction sits at the start of the final exon", fwd.lastJunctionT, 300);
+eq("first coding base maps to the CDS start", fwd.genomicOfCds(0), 1100);
+eq("CDS offset crosses into the second block", fwd.genomicOfCds(100), 2000);
+eq("CDS offset crosses into the third block", fwd.genomicOfCds(200), 3000);
+check("a codon spanning two blocks is detected", fwd.codonSpansJunction(98));
+check("a codon inside one block is not", !fwd.codonSpansJunction(97));
+
+/* Reverse strand: the same geometry read the other way. Transcript order runs
+   from the highest coordinate down, so this exercises the strand branches that
+   the forward-strand fixtures never reach. */
+var rev = ptc.buildTranscriptModel(
+  [{ seq_region_name: "1", start: 3000, end: 3099, strand: -1 },
+   { seq_region_name: "1", start: 2000, end: 2099, strand: -1 },
+   { seq_region_name: "1", start: 1100, end: 1199, strand: -1 }],
+  [{ start: 3000, end: 3399 }, { start: 2000, end: 2099 }, { start: 1000, end: 1199 }]
+);
+eq("reverse CDS length", rev.cdsLength, 300);
+/* The first coding base is the high end of the first coding block, not the
+   high end of the exon that contains it -- the exon carries 300 nt of UTR
+   above the CDS start. */
+eq("reverse first coding base is the top of the first coding block",
+  rev.genomicOfCds(0), 3099);
+eq("reverse transcript length", rev.transcriptLength, 700);
+eq("reverse last junction", rev.lastJunctionT, 500);
+check("reverse coding positions decrease along the CDS",
+  rev.genomicOfCds(1) < rev.genomicOfCds(0));
+eq("reverse CDS crosses into the second block", rev.genomicOfCds(100), 2099);
+
+/* A long final 3' UTR exon pushes the last junction downstream, which can make
+   even a late PTC NMD-competent. Computing the junction from coding blocks
+   alone would get this wrong. */
+var utrExons = ptc.buildTranscriptModel(
+  [{ seq_region_name: "1", start: 1000, end: 1299, strand: 1 }],
+  [{ start: 1000, end: 1399 }, { start: 2000, end: 2099 }]
+);
+eq("single coding exon plus a UTR exon still has a junction", utrExons.lastJunctionT, 400);
+/* The last coding codon sits 110 nt from the junction because 100 nt of 3' UTR
+   follow it in the same exon and another exon follows that. A junction computed
+   from coding blocks alone would sit at the stop codon and call this an escape. */
+var lateUtr = ptc.classifyNmd(290, utrExons);
+eq("a late PTC is competent because the junction lies out in the UTR",
+  lateUtr.verdict, "competent");
+eq("distance measured past the end of the CDS", lateUtr.distanceToLastJunction, 110);
+
+/* Single-exon transcript: no junction, so no exon junction complex. */
+var oneExon = ptc.buildTranscriptModel(
+  [{ seq_region_name: "1", start: 1000, end: 1899, strand: 1 }],
+  [{ start: 1000, end: 1899 }]
+);
+var oneVerdict = ptc.classifyNmd(500, oneExon);
+eq("single-exon transcript escapes NMD", oneVerdict.verdict, "escapes");
+check("reason is the absence of a junction",
+  oneVerdict.escapes.some(function (e) { return e.rule === "single_exon"; }));
+
+/* Long-exon rule. */
+var longExon = ptc.buildTranscriptModel(
+  [{ seq_region_name: "1", start: 1000, end: 1499, strand: 1 },
+   { seq_region_name: "1", start: 5000, end: 5099, strand: 1 }],
+  [{ start: 1000, end: 1499 }, { start: 5000, end: 5399 }]
+);
+var longVerdict = ptc.classifyNmd(300, longExon);
+check("a PTC in a 500 nt exon is flagged by the long-exon rule",
+  longVerdict.escapes.some(function (e) { return e.rule === "long_exon"; }),
+  JSON.stringify(longVerdict.escapes));
+eq("long exon alone leaves the verdict uncertain, not escaping",
+  longVerdict.verdict, "uncertain");
+
+/* The 55 nt threshold, checked on the exact boundary. Coding runs right up to
+   the last junction here, so distance equals 400 minus the CDS offset. */
+var edge = ptc.buildTranscriptModel(
+  [{ seq_region_name: "1", start: 1000, end: 1199, strand: 1 },
+   { seq_region_name: "1", start: 2000, end: 2199, strand: 1 }],
+  [{ start: 1000, end: 1199 }, { start: 2000, end: 2199 }, { start: 3000, end: 3099 }]
+);
+eq("last junction", edge.lastJunctionT, 400);
+var at55 = ptc.classifyNmd(345, edge);
+eq("exactly 55 nt from the junction", at55.distanceToLastJunction, 55);
+eq("55 nt is competent", at55.verdict, "competent");
+var at54 = ptc.classifyNmd(346, edge);
+eq("one base closer is 54 nt", at54.distanceToLastJunction, 54);
+eq("54 nt escapes", at54.verdict, "escapes");
+check("the escape names the junction rule",
+  at54.escapes.some(function (e) { return e.rule === "last_junction_proximity"; }));
+
+/* ------------------------------------------------------------------ */
 (async function main() {
 
   section("End to end: ClinVar missense -> zebrafish guide");
@@ -183,14 +301,130 @@ eq("four residues", idx.length, 4);
     direct.strategies[0].edits[0].guides[0].spacer, top.spacer);
 
   /* ---------------------------------------------------------------- */
-  section("Truncating variants are refused, not mapped");
+  section("Out-of-scope variant classes are refused with a reason");
 
-  var trunc = await pipeline.run("VCV000088888", OPTS);
-  eq("status", trunc.status, "unsupported_consequence");
-  eq("classified as nonsense", trunc.variant.consequence, "nonsense");
-  check("reason names the premature-stop strategy",
-    /premature stop/.test(trunc.reason), trunc.reason);
-  eq("nothing designed", trunc.strategies.length, 0);
+  var stopLoss = await pipeline.run("TESTA:p.Ter150Leu", OPTS);
+  eq("stop-loss status", stopLoss.status, "unsupported_consequence");
+  eq("classified as stop-loss", stopLoss.variant.consequence, "stop-loss");
+  check("reason explains why a premature stop is the wrong model",
+    /read-through|extends the protein/.test(stopLoss.reason), stopLoss.reason);
+  eq("nothing designed", stopLoss.strategies.length, 0);
+
+  var syn = await pipeline.run("TESTA:p.Arg100=", OPTS);
+  eq("synonymous status", syn.status, "unsupported_consequence");
+
+  /* ---------------------------------------------------------------- */
+  section("Truncating variants route to a premature stop");
+
+  var ptcRun = await pipeline.run("VCV000077777", OPTS);
+  eq("status", ptcRun.status, "ok");
+  eq("strategy chosen", ptcRun.strategyType, "premature_stop");
+  eq("classified as nonsense", ptcRun.variant.consequence, "nonsense");
+  eq("truncation point located", ptcRun.orthologSummary.located, 1);
+
+  var ps = ptcRun.strategies[0];
+  eq("strategy status", ps.status, "designed");
+  eq("human residue 100 maps to zebrafish 90", ps.zebrafishResidue, 90);
+  eq("exon count", ps.exonCount, 3);
+  eq("CDS length", ps.cdsLength, 420);
+  eq("protein length", ps.proteinLength, 140);
+  check("position is exact, not borrowed from a neighbour", !ps.approximatePosition);
+
+  eq("stop-able codons found", ps.scan.total, 7);
+  eq("only cytosine editing is needed here", ps.scan.families.join(","), "CBE");
+  check("codons used are the classic iSTOP set",
+    Object.keys(ps.scan.byCodon).sort().join(",") === "CAA,CAG,CGA,TGG",
+    Object.keys(ps.scan.byCodon).sort().join(","));
+  eq("NMD-competent candidates", ps.scan.byNmdVerdict.competent, 4);
+  eq("NMD-escaping candidates", ps.scan.byNmdVerdict.escapes, 2);
+  eq("NMD-uncertain candidates", ps.scan.byNmdVerdict.uncertain, 1);
+
+  /* Ranking: competence first, then nearest to the lesion, with a stop
+     downstream of it penalised against one the same distance upstream. */
+  eq("first candidate is the competent one nearest the lesion", ps.candidates[0].residue, 85);
+  eq("first candidate is upstream of the lesion", ps.candidates[0].distanceFromLesion, -5);
+  check("all escaping candidates rank below all competent ones",
+    ps.candidates.findIndex(function (c) { return c.nmd.verdict === "escapes"; }) >
+    ps.candidates.map(function (c) { return c.nmd.verdict; }).lastIndexOf("competent"));
+  check("a stop 5 residues after the lesion outranks one 30 before",
+    ps.candidates.findIndex(function (c) { return c.residue === 95; }) <
+    ps.candidates.findIndex(function (c) { return c.residue === 60; }));
+
+  var best = ps.candidates[0];
+  eq("codon", best.wtCodon + ">" + best.stopCodon, "CAA>TAA");
+  eq("required change", best.change, "C>T");
+  eq("chemistry", best.family, "CBE");
+  eq("sense-strand guide for a cytosine", best.strand, "+");
+  eq("NMD verdict", best.nmd.verdict, "competent");
+  check("distance to the last junction clears the 55 nt threshold",
+    best.nmd.distanceToLastJunction >= 55, String(best.nmd.distanceToLastJunction));
+  check("guides designed", best.guideCount > 0);
+
+  /* Re-derive the top guide and confirm the edit really makes a stop. */
+  var pg = best.designs[0].guides[0];
+  var prc = function (x) {
+    return x.split("").reverse().map(function (c) {
+      return { A: "T", T: "A", G: "C", C: "G" }[c];
+    }).join("");
+  };
+  var pseq = best.contextSequence;
+  var pti = best.contextCodonOffset + best.codonPosition - 1;
+  var pwork = pg.strand === "+" ? pseq : prc(pseq);
+  var pwt = pg.strand === "+" ? pti : pseq.length - 1 - pti;
+  var pstart = pwt - (pg.positionInWindow - 1);
+  eq("top guide spacer re-derived", pwork.substr(pstart, 20), pg.spacer);
+  eq("top guide PAM re-derived", pwork.substr(pstart + 20, pg.pam.length), pg.pam);
+  eq("codon in context matches the CDS",
+    pseq.substr(best.contextCodonOffset, 3), "CAA");
+  var pedited = pseq.substring(0, pti) + "T" + pseq.substring(pti + 1);
+  eq("edited codon is a stop",
+    UMAX.CODONS[pedited.substr(best.contextCodonOffset, 3)], "*");
+
+  /* The escaping candidates must carry their reason, not just a label. */
+  var escaping = ps.candidates.filter(function (c) { return c.nmd.verdict === "escapes"; });
+  check("each escape names a rule and explains it",
+    escaping.every(function (c) {
+      return c.nmd.escapes.length && c.nmd.escapes.every(function (e) { return e.rule && e.detail; });
+    }));
+  check("last-exon escape identified",
+    escaping.some(function (c) {
+      return c.nmd.escapes.some(function (e) { return e.rule === "last_exon"; });
+    }));
+  check("junction-proximity escape identified",
+    escaping.some(function (c) {
+      return c.nmd.escapes.some(function (e) { return e.rule === "last_junction_proximity"; });
+    }));
+  check("start-proximal candidate flagged uncertain rather than competent",
+    ps.candidates.some(function (c) {
+      return c.residue === 10 && c.nmd.verdict === "uncertain" &&
+        c.nmd.escapes.some(function (e) { return e.rule === "start_proximal"; });
+    }));
+
+  /* A candidate whose window runs into the intron must flag every guide. */
+  var finalExon = ps.candidates.find(function (c) { return c.residue === 118; });
+  var feGuides = (finalExon.designs || []).flatMap(function (d) { return d.guides; });
+  check("guides at the final-exon candidate all cross the junction",
+    feGuides.length > 0 && feGuides.every(function (g) { return g.crossesExonBoundary; }));
+  check("guides elsewhere in the exon body do not",
+    best.designs[0].guides.every(function (g) { return !g.crossesExonBoundary; }));
+
+  /* ---------------------------------------------------------------- */
+  section("Frameshift and start loss take the same path");
+
+  var fsRun = await pipeline.run("VCV000066666", OPTS);
+  eq("frameshift classified", fsRun.variant.consequence, "frameshift");
+  eq("frameshift routes to a premature stop", fsRun.strategyType, "premature_stop");
+  eq("frameshift designed", fsRun.status, "ok");
+  eq("same truncation point as the nonsense variant",
+    fsRun.strategies[0].zebrafishResidue, 90);
+
+  var slRun = await pipeline.run("VCV000055555", OPTS);
+  eq("start loss classified", slRun.variant.consequence, "start-loss");
+  eq("start loss routes to a premature stop", slRun.strategyType, "premature_stop");
+  check("start loss maps to the first residue",
+    slRun.strategies[0].zebrafishResidue === 1 ||
+    slRun.status === "not_modelable" || slRun.status === "isoform_mismatch",
+    "residue " + (slRun.strategies[0] || {}).zebrafishResidue + ", status " + slRun.status);
 
   /* ---------------------------------------------------------------- */
   section("Dead end: codon cannot reach the target residue");

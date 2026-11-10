@@ -308,24 +308,203 @@ write(N + "/esummary.fcgi?db=clinvar&retmode=json&id=99999", {
   }
 });
 
-/* A truncating variant, which v1 must refuse with a reason rather than map. */
-write(N + "/esearch.fcgi?db=clinvar&retmode=json&term=VCV000088888", {
-  esearchresult: { count: "1", idlist: ["88888"] }
-});
-write(N + "/esummary.fcgi?db=clinvar&retmode=json&id=88888", {
-  result: {
-    uids: ["88888"],
-    "88888": {
-      uid: "88888", accession: "VCV000088888",
-      title: "NM_000000.1(TESTA):c.298C>T (p.Arg100Ter)",
-      gene_sort: "TESTA", genes: [{ symbol: "TESTA", GeneID: "1" }],
-      germline_classification: { description: "Pathogenic" },
-      variation_set: [{
-        variation_name: "NM_000000.1(TESTA):c.298C>T (p.Arg100Ter)",
-        molecular_consequence_list: ["nonsense"]
-      }]
-    }
+/* ================================================================== *
+ * TESTG: a truncating variant and the premature-stop path.
+ *
+ * A synthetic locus built so the CDS, the translation map, the exon
+ * structure and every genomic slice are derived from one genome string
+ * and therefore cannot disagree. Three exons with a single-exon 3' UTR,
+ * which puts the last exon-exon junction at the start of the final
+ * coding exon and so produces all three NMD regimes:
+ *
+ *   residue  10  cdsOffset  27  start-proximal      -> uncertain
+ *   residue  60  cdsOffset 177  mid-CDS             -> competent
+ *   residue  85  cdsOffset 252  5 before the lesion -> competent, ranks first
+ *   residue  95  cdsOffset 282  5 after the lesion  -> competent
+ *   residue 101  cdsOffset 300  50 nt from junction -> escapes
+ *   residue 118  cdsOffset 351  final exon          -> escapes
+ * ================================================================== */
+var ptc = require("../lib/ptc.js");
+var palette = require("../lib/palette.js");
+var UMAX = require("../vendor/umax.js");
+
+var PTC_CHROM = "9";
+var PTC_EXONS = [
+  { start: 10000, end: 10199 },
+  { start: 20000, end: 20199 },
+  { start: 30000, end: 30299 }
+];
+/* Coding blocks for residues 1..140 -- 420 nt. The terminal stop occupies
+   30070-30072 and is in the CDS sequence but not the translation map, which
+   is how Ensembl reports it. */
+var PTC_CDS_BLOCKS = [
+  { start: 10050, end: 10199 },
+  { start: 20000, end: 20199 },
+  { start: 30000, end: 30069 }
+];
+
+var SAFE = ["GCT", "GGT", "ATC", "CTG", "ACC", "GTG", "TCC", "GAC", "AAC", "TTC", "CCA"];
+var PTC_CODONS = {
+  10: "CAA", 60: "CGA", 85: "CAA", 90: "CGT", 91: "GGT",
+  95: "TGG", 101: "CAG", 118: "CGA"
+};
+
+function ptcCoding() {
+  var codons = [];
+  for (var r = 1; r <= 140; r++) {
+    codons.push(PTC_CODONS[r] || SAFE[r % SAFE.length]);
   }
+  var seq = codons.join("");
+  if (seq.length !== 420) throw new Error("coding length " + seq.length);
+  var prot = UMAX.translate(seq);
+  if (prot.indexOf("*") >= 0) throw new Error("internal stop in PTC coding sequence");
+  return { seq: seq, protein: prot };
+}
+
+/* One genome string, every other sequence derived from it. */
+function ptcGenome(coding) {
+  var LO = 9900, HI = 30400;
+  var g = new Array(HI - LO + 1);
+  for (var i = 0; i < g.length; i++) g[i] = "ACGT".charAt((i * 7 + 3) % 4);
+
+  var written = 0;
+  PTC_CDS_BLOCKS.forEach(function (b) {
+    for (var p = b.start; p <= b.end; p++) g[p - LO] = coding.charAt(written++);
+  });
+  if (written !== 420) throw new Error("wrote " + written + " coding bases");
+  "TAA".split("").forEach(function (c, i) { g[30070 + i - LO] = c; });
+
+  return {
+    slice: function (lo, hi) { return g.slice(lo - LO, hi - LO + 1).join(""); }
+  };
+}
+
+var ptcCode = ptcCoding();
+var genome = ptcGenome(ptcCode.seq);
+
+/* Alignment: ten gaps at columns 20-29 shift zebrafish numbering back by ten,
+   so human residue 100 maps to zebrafish 90, and the aligned residues are the
+   real translation of the CDS so the two cannot disagree. */
+(function writePtcHomology() {
+  var hu = protein(150, { 100: "R" });
+  var p = ptcCode.protein;
+  var tgt = p.slice(0, 20) + "----------" + p.slice(20, 140);
+  if (tgt.length !== 150) throw new Error("ptc alignment length " + tgt.length);
+  if (tgt.charAt(99) !== p.charAt(89)) throw new Error("column 99 is not zebrafish residue 90");
+
+  write(E + "/homology/symbol/human/TESTG?target_species=danio_rerio;type=orthologues;sequence=protein;content-type=application/json", {
+    data: [{
+      id: "TESTG",
+      homologies: [{
+        type: "ortholog_one2one",
+        taxonomy_level: "Euteleostomi",
+        method_link_type: "ENSEMBL_ORTHOLOGUES",
+        dn_ds: null,
+        source: {
+          species: "homo_sapiens", taxon_id: 9606,
+          id: "ENSG00000TESTG", protein_id: "ENSP00000TESTG",
+          perc_id: 72.0, perc_pos: 83.0, cigar_line: "150M", align_seq: hu
+        },
+        target: {
+          species: "danio_rerio", taxon_id: 7955,
+          id: "ENSDARG00000000020", protein_id: "ENSDARP00000000020",
+          perc_id: 69.0, perc_pos: 81.0, cigar_line: "20M10D120M", align_seq: tgt
+        }
+      }]
+    }]
+  });
+})();
+
+write(E + "/lookup/id/ENSDARP00000000020?content-type=application/json", {
+  id: "ENSDARP00000000020", object_type: "Translation", species: "danio_rerio",
+  Parent: "ENSDART00000000020", length: 140, db_type: "core"
+});
+
+write(E + "/sequence/id/ENSDART00000000020?type=cds;content-type=application/json", {
+  id: "ENSDART00000000020", molecule: "dna", desc: null,
+  seq: ptcCode.seq + "TAA"
+});
+
+write(E + "/map/translation/ENSDARP00000000020/1..140?content-type=application/json", {
+  mappings: PTC_CDS_BLOCKS.map(function (b, i) {
+    return {
+      seq_region_name: PTC_CHROM, start: b.start, end: b.end, strand: 1,
+      coord_system: "chromosome", assembly_name: "GRCz11", gap: 0, rank: i
+    };
+  })
+});
+
+write(E + "/overlap/id/ENSDART00000000020?feature=exon;content-type=application/json",
+  PTC_EXONS.map(function (e, i) {
+    return {
+      id: "ENSDARE0000000002" + i, Parent: "ENSDART00000000020",
+      feature_type: "exon", seq_region_name: PTC_CHROM, strand: 1,
+      start: e.start, end: e.end, rank: i + 1, assembly_name: "GRCz11"
+    };
+  }));
+
+/* Region fixtures for every candidate the real scan finds, so the cache is
+   complete whatever --ptc-top is set to. Generated by running the same scan
+   the pipeline runs, against the same genome string. */
+(function writePtcRegions() {
+  var pal = palette.buildPalette(UMAX.FAMILY);
+  var model = ptc.buildTranscriptModel(
+    PTC_CDS_BLOCKS.map(function (b) {
+      return { seq_region_name: PTC_CHROM, start: b.start, end: b.end, strand: 1 };
+    }),
+    PTC_EXONS.map(function (e) { return { start: e.start, end: e.end }; })
+  );
+  if (model.error) throw new Error("ptc model: " + model.error);
+
+  var candidates = ptc.scanCds(ptcCode.seq, model, UMAX.CODONS, pal, { targetResidue: 90 });
+  var seen = {};
+  candidates.forEach(function (c) {
+    var a = model.genomicOfCds(c.cdsOffset);
+    var b = model.genomicOfCds(c.cdsOffset + 2);
+    var lo = Math.min(a, b) - 45, hi = Math.max(a, b) + 45;
+    var region = PTC_CHROM + ":" + lo + "-" + hi;
+    if (seen[region]) return;
+    seen[region] = true;
+    write(E + "/sequence/region/danio_rerio/" + region + ":1?content-type=application/json", {
+      id: "chromosome:GRCz11:" + PTC_CHROM + ":" + lo + ":" + hi + ":1",
+      seq: genome.slice(lo, hi), molecule: "dna"
+    });
+  });
+
+  console.log("PTC scan: " + candidates.length + " candidates, " +
+    Object.keys(seen).length + " region fixtures");
+  candidates.forEach(function (c) {
+    console.log("  residue " + String(c.residue).padStart(3) + " " + c.wtCodon + ">" +
+      c.stopCodon + " " + c.change + " " + c.family +
+      " d=" + String(c.distanceFromTarget).padStart(4) +
+      " nmd=" + c.nmd.verdict +
+      (c.nmd.escapes && c.nmd.escapes.length ? " [" + c.nmd.escapes.map(function (e) { return e.rule; }).join(",") + "]" : ""));
+  });
+})();
+
+/* ClinVar records for the truncating classes. */
+[["VCV000077777", "77777", "c.298C>T (p.Arg100Ter)", "nonsense"],
+ ["VCV000066666", "66666", "c.299del (p.Arg100fs)", "frameshift"],
+ ["VCV000055555", "55555", "c.3G>A (p.Met1?)", "start-loss"]
+].forEach(function (rec) {
+  write(N + "/esearch.fcgi?db=clinvar&retmode=json&term=" + rec[0], {
+    esearchresult: { count: "1", idlist: [rec[1]] }
+  });
+  write(N + "/esummary.fcgi?db=clinvar&retmode=json&id=" + rec[1], {
+    result: {
+      uids: [rec[1]],
+      [rec[1]]: {
+        uid: rec[1], accession: rec[0],
+        title: "NM_000000.1(TESTG):" + rec[2],
+        gene_sort: "TESTG", genes: [{ symbol: "TESTG", GeneID: "2" }],
+        germline_classification: { description: "Pathogenic" },
+        variation_set: [{
+          variation_name: "NM_000000.1(TESTG):" + rec[2],
+          molecular_consequence_list: [rec[3]]
+        }]
+      }
+    }
+  });
 });
 
 console.log("fixtures written to " + DIR);
